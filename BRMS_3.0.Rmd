@@ -1,5 +1,5 @@
 ---
-title: "BRMS_3.0"
+title: "Prior Predictive Checks & Model Validation"
 output: html_document
 date: "2025-12-05"
 ---
