@@ -1,0 +1,784 @@
+---
+title: "FH2T Analysis — Neat & De-duplicated"
+date: "2025-11-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Loading the necessities (e.g. libraries) and building the data-structure
+
+## 1.1 Cmdstanr path and loading libraries
+```{r}
+cmdstanr::cmdstan_path()
+cmdstanr::cmdstan_version()
+```
+
+```{r libraries}
+library(dplyr)
+library(readr)
+library(stringr)
+library(cmdstanr)
+library(posterior)
+library(tidyr)
+library(purrr)
+library(rlang)
+library(tidybayes)
+library(ggdist)
+library(ggplot2)
+library(patchwork)
+library(brms)
+library(tibble)
+```
+
+## 2 Data pre-processing
+
+## 2.1 Writing functions to ensure clean and interpretable column-names and such
+
+```{r helpers}
+inv_logit <- function(x) 1/(1+exp(-x))
+
+to_binary01 <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.integer(x))
+  x_chr <- tolower(trimws(as.character(x)))
+  as.integer(dplyr::case_when(
+    x_chr %in% c("1","true","t","yes","y","correct","right") ~ 1L,
+    x_chr %in% c("0","false","f","no","n","incorrect","wrong") ~ 0L,
+    TRUE ~ NA_integer_
+  ))
+}
+
+to_binary01 <- function(x) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.numeric(x)) return(as.integer(x))
+  x_chr <- tolower(trimws(as.character(x)))
+  as.integer(dplyr::case_when(
+    x_chr %in% c("1","true","t","yes","y","correct","right") ~ 1L,
+    x_chr %in% c("0","false","f","no","n","incorrect","wrong") ~ 0L,
+    TRUE ~ NA_integer_
+  ))
+}
+
+rename_algebra <- function(df, test_code) {
+  # Accept any two-digit code, e.g. "01", "12", "02", etc.
+  if (!str_detect(test_code, "^[0-9]{2}$"))
+    stop("test_code must be a two-digit string like '01' or '12'.")
+
+  # Columns like: correct_12_XX_[C|P|F]
+  pat  <- paste0("^correct_", test_code, "_\\d+_[CPF]$")
+  cols <- names(df)[str_detect(names(df), pat)]
+  if (length(cols) == 0)
+    stop("No columns matching pattern ", pat, " were found. Check your column names.")
+
+  meta <- tibble(orig = cols) |>
+    mutate(
+      item_num    = as.integer(str_extract(orig, "(?<=correct_\\d{2}_)\\d+")),
+      type_letter = str_extract(orig, "[CPF]$"),
+      type_long   = recode(type_letter,
+                           C = "conceptual",
+                           P = "procedural",
+                           F = "flexibility",
+                           .default = NA_character_)
+    ) |>
+    arrange(type_letter, item_num) |>
+    group_by(type_letter, type_long) |>
+    mutate(type_idx = row_number()) |>
+    ungroup() |>
+    mutate(prefix  = ifelse(test_code %in% c("01","02"),        # treat 01/02 as pre/post if you want
+                            ifelse(test_code == "01", "alg_pre", "alg_post"),
+                            ifelse(test_code == "12", "alg_post", "alg_pre")),  # your file uses 12 for POST
+           new     = paste0(prefix, "_", type_long, "_", type_idx),
+           new_short = paste0(prefix, "_", type_letter, type_idx))
+
+  # perform rename
+  rename_map <- setNames(meta$orig, meta$new)
+  df_renamed <- df |> rename(!!!rename_map)
+
+  list(
+    data = df_renamed,
+    mapping = meta |> select(orig, new, new_short, item_num, type_letter, type_long)
+  )
+}
+
+rename_equivalence_simple <- function(df, when = c("pre","post")) {
+  when <- match.arg(when)
+
+  if (when == "pre") {
+    Tcode <- "T1"
+    P2tagE <- "Part1aE"
+    P2tagN <- "Part1aNE"
+    prefix <- "eq_pre"
+  } else {
+    Tcode <- "T3"
+    P2tagE <- "Part1bE"
+    P2tagN <- "Part1bNE"
+    prefix <- "eq_post"
+  }
+
+  cols <- names(df)
+
+  # Part 1 (judgement)
+  rx_p1  <- paste0("^", Tcode, "P1\\s+PS_?Part1_?Test\\d+$")
+  p1_cols <- cols[str_detect(cols, rx_p1)]
+
+  # Part 2 (either E or NE)
+  rx_p2e <- paste0("^", Tcode, "P2E\\s+PS_", Tcode, "_", P2tagE, "_Test\\d+$")
+  rx_p2n <- paste0("^", Tcode, "P2NE\\s+PS_", Tcode, "_", P2tagN, "_Test\\d+$")
+  p2_cols <- cols[str_detect(cols, rx_p2e) | str_detect(cols, rx_p2n)]
+
+  if (length(p1_cols) + length(p2_cols) == 0)
+    stop("No equivalence columns matched for '", when, "'. Check naming/patterns.")
+
+  meta <- bind_rows(
+    tibble(orig = p1_cols, part = "part1"),
+    tibble(orig = p2_cols, part = "part2")
+  ) |>
+    mutate(item_num = as.integer(str_extract(orig, "(?<=Test)\\d+$"))) |>
+    arrange(factor(part, levels = c("part1","part2")), item_num) |>
+    group_by(part) |>
+    mutate(idx = row_number()) |>
+    ungroup() |>
+    mutate(new = paste0(prefix, "_", part, "_", idx))
+
+  # apply rename
+  rename_map <- setNames(meta$orig, meta$new)
+  df2 <- df |> rename(!!!rename_map)
+
+  list(
+    data = df2,
+    mapping = meta |> select(orig, new, part, item_num)
+  )
+}
+
+pick_any <- function(df, candidates) {
+  present <- intersect(candidates, names(df))
+  if (length(present) == 0) character(0) else present
+}
+
+std_id <- function(df) {
+  id_candidates <- c("StuID","student_id","stu_id")
+  present <- intersect(id_candidates, names(df))
+  if (length(present) == 0) stop("No StuID-like column found.")
+  df %>%
+    dplyr::mutate(StuID = as.character(dplyr::coalesce(!!!rlang::syms(present)))) %>%
+    dplyr::select(-dplyr::any_of(setdiff(present, "StuID"))) %>%
+    dplyr::distinct(StuID, .keep_all = TRUE)
+}
+
+order_alg <- function(nms) {
+  if (length(nms) == 0) return(character(0))
+  if (all(stringr::str_detect(nms, "^(alg_pre|alg_post)_(conceptual|procedural|flexibility)_\\d+$"))) {
+    tibble::tibble(name = nms) |>
+      dplyr::mutate(type = stringr::str_match(name, "_(conceptual|procedural|flexibility)_")[,2],
+                    idx  = as.integer(stringr::str_match(name, "_(\\d+)$")[,2])) |>
+      dplyr::arrange(factor(type, levels = c("conceptual","procedural","flexibility")), idx) |>
+      dplyr::pull(name)
+  } else {
+    tibble::tibble(name = nms) |>
+      dplyr::mutate(type = stringr::str_match(name, "_([CPF])\\d+$")[,2],
+                    idx  = as.integer(stringr::str_match(name, "(\\d+)$")[,2])) |>
+      dplyr::arrange(factor(type, levels = c("C","P","F")), idx) |>
+      dplyr::pull(name)
+  }
+}
+
+make_long_two <- function(Y_pre, Y_post, test_of_item, stu_id = NULL) {
+  N <- nrow(Y_pre); J <- ncol(Y_pre)
+  i_pre  <- rep(seq_len(N), each = J);  j_pre <- rep(seq_len(J), times = N)
+  t_pre  <- rep(0L, N*J);               s_pre <- rep(test_of_item, times = N)
+  i_post <- rep(seq_len(N), each = J);  j_post <- rep(seq_len(J), times = N)
+  t_post <- rep(1L, N*J);               s_post <- rep(test_of_item, times = N)
+  y <- c(as.integer(Y_pre), as.integer(Y_post))
+  i <- c(i_pre, i_post); j <- c(j_pre, j_post); t <- c(t_pre, t_post); s <- c(s_pre, s_post)
+  keep <- which(!is.na(y))
+  list(y = y[keep], i = i[keep], j = j[keep], t = t[keep], s = s[keep],
+       N = N, J = J, S = length(unique(test_of_item)),
+       test_of_item = as.integer(test_of_item),
+       stu_id = stu_id)
+}
+
+choose_grainsize <- function(N, J, chains = 4, threads_per_chain = 8, tasks_per_thread = 8L) {
+  n_obs <- as.integer(N * J)
+  n_threads <- as.integer(chains * threads_per_chain)
+  as.integer(max(1L, ceiling(n_obs / (n_threads * tasks_per_thread))))
+}
+
+zfun <- function(x) {
+  m <- mean(x, na.rm = TRUE); s <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
+  z <- (x - m) / s; z[is.na(z)] <- 0; as.numeric(z)
+}
+```
+
+
+## 2.2 Data import, merge, and Stan data preparation
+
+```{r}
+
+# --------------------- 1) Load & rename assessments --------------------------
+
+assess_path <- '/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Bachelor Data/Data/assessments/assess_problem.csv'
+assess <- readr::read_csv(assess_path, show_col_types = FALSE)
+
+# Algebra pre/post
+pre_res  <- rename_algebra(assess, test_code = "01");  assess <- pre_res$data
+post_res <- rename_algebra(assess, test_code = "12");  assess <- post_res$data
+
+# Equivalence pre/post
+eq_pre_res  <- rename_equivalence_simple(assess, when = "pre");  assess <- eq_pre_res$data
+eq_post_res <- rename_equivalence_simple(assess, when = "post"); assess <- eq_post_res$data
+
+# Pick columns for items + IDs + condition + MA/MSE
+df <- assess %>%
+  dplyr::select(
+    any_of(c(
+      "StuID",
+      # ⬇️ keep these exactly as-is (they’re in assess_problem.csv)
+      "pre_MA_total_score", "pre_MSE_total_score",
+      # optional: if condition is also in this file, keep one of these:
+      "condition_assignment","condition","assignment"
+    )),
+    dplyr::matches("^alg_(pre|post)_(conceptual|procedural|flexibility)_\\d+$"),
+    dplyr::matches("^alg_(pre|post)_[CPF]\\d+$"),
+    dplyr::matches("^eq_(pre|post)_part[12]_\\d+$"),
+    dplyr::matches("^eq_(pre|post)_(p1|p2e|p2n)_\\d+$")
+  )
+
+# --------------------- 2) Load student metadata & roster ---------------------
+att_path  <- '/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Bachelor Data/Data/student/student_attendance.csv'
+demo_path <- '/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Bachelor Data/Data/student/student_demo.csv'
+fid_path  <- '/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Bachelor Data/Data/student/student_fidelity.csv'
+rost_path <- '/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Bachelor Data/Data/student/student_roster.csv'
+
+att_raw  <- readr::read_csv(att_path,  show_col_types = FALSE)
+demo_raw <- readr::read_csv(demo_path, show_col_types = FALSE)
+fid_raw  <- readr::read_csv(fid_path,  show_col_types = FALSE)
+rost_raw <- readr::read_csv(rost_path, show_col_types = FALSE)
+
+
+# ---- MA/MSE covariates from assess_student.csv ----
+assess_student_raw <- readr::read_csv(assess_student_path, show_col_types = FALSE)
+
+# Keep a standardized StuID and MA/MSE columns (robust to naming variants)
+ma_candidates <- c("pre_MA_total_score","pre_MSE_total_score","pre_ma_total_score","pre_mse_total_score",
+                   "MA_pre_total","MSE_pre_total","ma_pre_total","mse_pre_total")
+ma_keep <- std_id(
+  assess_student_raw %>%
+    dplyr::select(dplyr::all_of(
+      c(pick_any(assess_student_raw, c("StuID","student_id","stu_id")),
+        pick_any(assess_student_raw, ma_candidates))
+    ))
+)
+att_keep  <- std_id(att_raw %>% dplyr::select(dplyr::all_of(pick_any(att_raw,
+  c("StuID","student_id","stu_id","days_present","DaysPresent","present_days",
+    "days_absent","DaysAbsent","absent_days","attendance_rate","AttendanceRate")))))
+demo_keep <- std_id(demo_raw %>% dplyr::select(dplyr::all_of(pick_any(demo_raw, c("StuID","student_id","stu_id",
+   "grade","Grade","gender","Gender","race_ethnicity","RaceEthnicity","race","Race","ethnicity","Ethnicity")))))
+fid_keep  <- std_id(fid_raw %>% dplyr::select(dplyr::all_of(pick_any(fid_raw,
+  c("StuID","student_id","stu_id","sessions_completed","sessions","num_sessions",
+    "minutes_total","total_minutes","time_on_task_minutes")))))
+ros_keep  <- std_id(rost_raw %>% dplyr::select(dplyr::all_of(pick_any(rost_raw, c(
+  "StuID","student_id","stu_id",
+  # school/class at assignment time
+  "SchIDPre","SchIDEnd","ClaIDPre","ClaIDEnd",
+  # condition if present here
+  "condition_assignment","condition","assignment"
+)))))
+
+# Keep PRE/END group ids, prefer PRE; fill from END if missing
+rost_ids <- ros_keep %>%
+  dplyr::transmute(
+    StuID,
+    SchIDPre = dplyr::na_if(as.character(SchIDPre), ""),
+    SchIDEnd = dplyr::na_if(as.character(SchIDEnd), ""),
+    ClaIDPre = dplyr::na_if(as.character(ClaIDPre), ""),
+    ClaIDEnd = dplyr::na_if(as.character(ClaIDEnd), ""),
+    school_id = dplyr::coalesce(SchIDPre, SchIDEnd, "MISSING"),
+    class_id  = dplyr::coalesce(ClaIDPre, ClaIDEnd, "MISSING"),
+    # pass through a condition column if roster has it
+    condition_assignment = dplyr::coalesce(!!!rlang::syms(intersect(
+      c("condition_assignment","condition","assignment"), names(ros_keep))))
+  )
+
+# Merge metadata onto assessment rows
+df_merged <- df %>%
+  dplyr::mutate(StuID = as.character(StuID)) %>%
+  dplyr::left_join(rost_ids, by = "StuID") %>%
+  dplyr::left_join(demo_keep, by = "StuID") %>%
+  dplyr::left_join(ma_keep, by = "StuID") %>%
+  dplyr::left_join(att_keep,  by = "StuID") %>%
+  dplyr::left_join(fid_keep,  by = "StuID")
+
+# --------------------- 3) Conditions and treatment flags ---------------------
+cond_col <- intersect(c("condition_assignment.y","condition","assignment"), names(df_merged))[1]
+if (is.na(cond_col)) stop("No condition column found (looked for condition_assignment/condition/assignment).")
+
+df_merged <- df_merged %>%
+  dplyr::filter(.data[[cond_col]] %in% c("FH2T","Instant","Delay")) %>%
+  dplyr::mutate(
+    Tassign = as.integer(.data[[cond_col]] == "FH2T")
+  )
+
+cat("Kept N rows after arm filter:", nrow(df_merged), "\n")
+
+# --------------------- 4) Select assessment item columns ---------------------
+# Equivalence (pre/post)
+eq_pre_cols  <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^eq_pre_(part1|part2)_\\d+$")) %>% sort()
+eq_post_cols <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^eq_post_(part1|part2)_\\d+$")) %>% sort()
+
+# Algebra (pre/post) long or short naming
+alg_pre_long  <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^alg_pre_(conceptual|procedural|flexibility)_\\d+$"))
+alg_post_long <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^alg_post_(conceptual|procedural|flexibility)_\\d+$"))
+alg_pre_short  <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^alg_pre_[CPF]\\d+$"))
+alg_post_short <- names(df_merged) %>% purrr::keep(~ stringr::str_detect(.x, "^alg_post_[CPF]\\d+$"))
+
+order_alg <- function(nms) {
+  if (length(nms) == 0) return(character(0))
+  if (all(stringr::str_detect(nms, "^(alg_pre|alg_post)_(conceptual|procedural|flexibility)_\\d+$"))) {
+    tibble::tibble(name = nms) |>
+      dplyr::mutate(type = stringr::str_match(name, "_(conceptual|procedural|flexibility)_")[,2],
+                    idx  = as.integer(stringr::str_match(name, "_(\\d+)$")[,2])) |>
+      dplyr::arrange(factor(type, levels = c("conceptual","procedural","flexibility")), idx) |>
+      dplyr::pull(name)
+  } else {
+    tibble::tibble(name = nms) |>
+      dplyr::mutate(type = stringr::str_match(name, "_([CPF])\\d+$")[,2],
+                    idx  = as.integer(stringr::str_match(name, "(\\d+)$")[,2])) |>
+      dplyr::arrange(factor(type, levels = c("C","P","F")), idx) |>
+      dplyr::pull(name)
+  }
+}
+
+alg_pre_cols  <- order_alg(if (length(alg_pre_long)) alg_pre_long else alg_pre_short)
+alg_post_cols <- order_alg(if (length(alg_post_long)) alg_post_long else alg_post_short)
+
+# Build matrices (keep NAs; we'll drop per-response later)
+eq_pre_mat   <- as.matrix(as.data.frame(lapply(df_merged[eq_pre_cols],  to_binary01)))
+eq_post_mat  <- as.matrix(as.data.frame(lapply(df_merged[eq_post_cols], to_binary01)))
+alg_pre_mat  <- as.matrix(as.data.frame(lapply(df_merged[alg_pre_cols],  to_binary01)))
+alg_post_mat <- as.matrix(as.data.frame(lapply(df_merged[alg_post_cols], to_binary01)))
+
+# Concatenate to define the pre and post forms
+Y_pre  <- cbind(eq_pre_mat,  alg_pre_mat)   # N x J_pre
+Y_post <- cbind(eq_post_mat, alg_post_mat)  # N x J_post
+
+J_pre  <- ncol(Y_pre);  J_post <- ncol(Y_post)
+N      <- nrow(df_merged)
+if (is.null(J_pre) || is.null(J_post) || J_pre == 0 || J_post == 0)
+  stop("Could not find pre/post items. Check renaming patterns.")
+
+cat("Students N =", N, " | J_pre =", J_pre, " | J_post =", J_post, "\n")
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 1. Makeing sure item columns are binary 0/1 (keeping NAs)
+# ---------------------------------------------------------
+
+# All item columns we care about
+pre_item_cols  <- c(eq_pre_cols,  alg_pre_cols)
+post_item_cols <- c(eq_post_cols, alg_post_cols)
+all_item_cols  <- c(pre_item_cols, post_item_cols)
+
+# Apply the to_binary01() helper to each item column
+df_items_bin <- df_merged %>%
+  mutate(
+    across(all_of(all_item_cols), ~ to_binary01(.x))
+  )
+
+# ---------------------------------------------------------
+# 2. Creating a lookup table for item_id and time
+#    item_id runs from 1..J_pre+J_post
+# ---------------------------------------------------------
+
+item_lookup <- tibble(
+  item_name = all_item_cols,
+  item_id   = seq_along(all_item_cols),
+  time      = c(
+    rep("pre",  length(pre_item_cols)),
+    rep("post", length(post_item_cols))
+  )
+)
+
+# ---------------------------------------------------------
+# 3. Adding student_id and basic grouping variables
+# ---------------------------------------------------------
+
+df_base <- df_items_bin %>%
+  mutate(
+    student_id = row_number(),            # 1..N
+    treatment  = as.integer(Tassign),     # 0/1
+    school_id  = factor(school_id),
+    class_id   = factor(class_id)
+  ) %>%
+  select(
+    student_id,
+    StuID,         
+    school_id,
+    class_id,
+    treatment,
+    all_of(all_item_cols)
+  )
+
+# ---------------------------------------------------------
+# 4. Pivot to long format and join item/time info
+# ---------------------------------------------------------
+
+df_analysis <- df_base %>%
+  pivot_longer(
+    cols      = all_of(all_item_cols),
+    names_to  = "item_name",
+    values_to = "response"
+  ) %>%
+  left_join(item_lookup, by = "item_name") %>%
+  mutate(
+    time     = factor(time, levels = c("pre", "post")),
+    response = ifelse(is.na(response), NA_integer_, as.integer(response))
+  ) %>%
+  arrange(student_id, time, item_id) %>%
+  select(
+    student_id,
+    item_id,
+    time,
+    treatment,
+    school_id,
+    class_id,
+    response,
+    everything()       
+  )
+
+# Quick sanity check
+df_analysis %>% glimpse()
+df_analysis %>% count(time)
+df_analysis %>% count(time, treatment)
+
+df_analysis <- df_analysis %>% select(-StuID, -item_name) # Removing StuID and item_name because we already have them as "student_id" and "item_id"
+```
+
+
+# 3. Model Specification and Model Fititng 
+
+## 3.1 Specifying the model and priors
+
+```{r}
+brms_formula <- bf(
+  response ~ 0 + time + time:treatment +
+    (1 + treatment | gr(item_id, by = time)) +
+    (1 + time | school_id / class_id / student_id)
+)
+
+# We use the same priors from the model validation code
+priors <- c(
+  # Fixed effects
+  prior(normal(0.0, 0.5), class = "b"),
+  # Group-level SDs
+  prior(exponential(2), class = "sd"),
+  # Correlations
+  prior(lkj(2), class = "cor")
+)
+```
+
+## 3.2 Fitting the model on the real data
+```{r}
+fit_prior <- brm(
+  formula       = brms_formula,
+  data          = df_analysis,
+  family        = bernoulli(link = "logit"),
+  prior        = priors,
+  iter         = 2000,
+  chains       = 4,
+  cores        = 4,
+  control = list(adapt_delta = 0.98, max_treedepth = 15),
+  seed          = 123,
+  backend = "cmdstanr",
+  file = "/Users/andersvaran/Desktop/CognitiveScience/5th semester/Bachelor/Code/brms_results"
+)
+```
+
+## 3.3 Checking model diagnostics
+```{r}
+plot(fit_prior)
+summary(fit_prior)
+```
+
+```{r}
+# open a pdf device
+pdf("fit_prior_diagnostics.pdf", width = 10, height = 7)
+
+# anything you plot between pdf() and dev.off() goes into that file
+plot(fit_prior)
+
+# close the device (writes the file)
+dev.off()
+```
+
+## 3.4 Plotting the contrast between the groups (Difference in Differences)
+```{r}
+mod <- fit_prior  # same as before
+
+# All combinations of time x treatment
+newdata_all <- tibble(
+  time      = factor(c("pre", "pre", "post", "post"), levels = c("pre", "post")),
+  treatment = c(0, 1, 0, 1)  # 0 = control, 1 = treatment
+)
+
+set.seed(123)
+ep_all <- posterior_epred(
+  mod,
+  newdata    = newdata_all,
+  re_formula = NA,
+  ndraws     = 2000
+)
+# ep_all: draws x 4, in order:
+#  1: Control - pre
+#  2: Treatment - pre
+#  3: Control - post
+#  4: Treatment - post
+
+df_all <- tibble(
+  epred     = c(ep_all),
+  time      = rep(newdata_all$time,      each = nrow(ep_all)),
+  treatment = rep(newdata_all$treatment, each = nrow(ep_all))
+) %>%
+  mutate(
+    group = if_else(treatment == 0, "Control", "Treatment"),
+    group_time = factor(
+      paste(group, time, sep = " - "),
+      levels = c(
+        "Treatment - post",
+        "Treatment - pre",
+        "Control - post",
+        "Control - pre"
+      )
+    )
+  ) %>%
+  filter(!is.na(epred))
+
+group_cols <- c(
+  "Control"   = "#F8766D",
+  "Treatment" = "#00BFC4"
+)
+
+my_theme <- theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+p_main <- ggplot(df_all, aes(x = epred, y = group_time, fill = group)) +
+  stat_halfeye(point_interval = median_qi, .width = c(0.5, 0.8, 0.95)) +
+  scale_fill_manual(values = group_cols) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x     = "P(correct)",
+    y     = NULL,
+    fill  = "Group",
+    title = "Posterior predicted accuracy by time and group"
+  ) +
+  my_theme + theme(plot.title = element_text(
+      face = "bold",
+      size = 12,       # bigger than base_size
+      hjust = 0.5      # center
+    ))
+
+did_draws <- tibble(
+  did = (ep_all[, 4] - ep_all[, 2]) - (ep_all[, 3] - ep_all[, 1])
+)
+
+
+p_did <- ggplot(did_draws, aes(x = did, y = 1)) +
+  stat_halfeye(
+    point_interval = median_qi,
+    .width = c(0.5, 0.8, 0.95),
+    fill = "#F4A261"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_y_continuous(NULL, breaks = NULL) +
+  labs(
+    x = "P(correct)",
+    y = NULL,
+    title = "Contrast (Treatment - Control)"
+  ) +
+  my_theme +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(
+      face = "bold",
+      size = 12,       # bigger than base_size
+      hjust = 0.5      # center
+    )
+  )
+
+# Combine: main plot (left) + DiD contrast (right)
+p_main + p_did + plot_layout(widths = c(4, 4))
+```
+
+```{r}
+# combine plot
+p_combined <- p_main + p_did + plot_layout(widths = c(4, 4))
+
+# ---- Save as PDF ----
+ggsave(
+  filename = "posterior_plot.pdf",
+  plot     = p_combined,
+  width    = 8,   # in inches
+  height   = 4
+)
+
+# ---- Or save as PNG (for html, slides, etc.) ----
+ggsave(
+  filename = "posterior_plot.png",
+  plot     = p_combined,
+  width    = 8,
+  height   = 4,
+  dpi      = 300
+)
+```
+
+
+## 3.5 Creating a pretty summary tabel and saving it
+
+```{r}
+# brms summary with 95% intervals
+s <- summary(fit_prior, prob = 0.95)
+
+## 1) Population-level (fixed) effects
+fixed_tbl <- as.data.frame(s$fixed) |>
+  rownames_to_column("parameter") |>
+  mutate(block = "Population-level effects")
+
+## 2) Group-level (random) effects
+random_tbl <- if (length(s$random)) {
+  imap_dfr(
+    s$random,
+    ~ as.data.frame(.x) |>
+      rownames_to_column("parameter") |>
+      mutate(block = paste0("Group-level effects (", .y, ")"))
+  )
+} else {
+  tibble()
+}
+
+## 3) Family-specific parameters (e.g., sigma, shape, phi, etc.)
+spec_tbl <- if (!is.null(s$spec_pars)) {
+  as.data.frame(s$spec_pars) |>
+    rownames_to_column("parameter") |>
+    mutate(block = "Family-specific parameters")
+} else {
+  tibble()
+}
+
+## 4) Correlation parameters (if present)
+cor_tbl <- if (!is.null(s$cor_pars)) {
+  as.data.frame(s$cor_pars) |>
+    rownames_to_column("parameter") |>
+    mutate(block = "Correlation parameters")
+} else {
+  tibble()
+}
+
+## 5) (Optional) Residual correlations, monotonic, GP, etc.
+rescor_tbl <- if (!is.null(s$rescor_pars)) {
+  as.data.frame(s$rescor_pars) |>
+    rownames_to_column("parameter") |>
+    mutate(block = "Residual correlations")
+} else {
+  tibble()
+}
+
+# You can add more blocks above if your model has gp / mo / etc.
+params_all <- bind_rows(
+  fixed_tbl,
+  random_tbl,
+  spec_tbl,
+  cor_tbl,
+  rescor_tbl
+) |>
+  # keep only columns we care about and add a nice CI string
+  mutate(
+    ci_95 = sprintf("%.2f, %.2f", `l-95% CI`, `u-95% CI`)
+  ) |>
+  select(
+    block,
+    parameter,
+    Estimate,
+    Est.Error,
+    ci_95,
+    Rhat,
+    Bulk_ESS,
+    Tail_ESS
+  )
+tbl_gt <- params_all |>
+  arrange(block, parameter) |>
+  gt(groupname_col = "block") |>
+  tab_header(
+    title    = md("**Table 1. Posterior summaries and diagnostics**"),
+    subtitle = "All model parameters with 95% credible intervals, Rhat, and effective sample sizes"
+  ) |>
+  cols_label(
+    parameter = "Parameter",
+    Estimate  = "Estimate",
+    Est.Error = "SE",
+    ci_95     = "95% CrI",
+    Rhat      = "R̂",
+    Bulk_ESS  = "Bulk ESS",
+    Tail_ESS  = "Tail ESS"
+  ) |>
+  fmt_number(
+    columns  = c(Estimate, Est.Error),
+    decimals = 2
+  ) |>
+  fmt_number(
+    columns  = Rhat,
+    decimals = 3
+  ) |>
+  fmt_number(
+    columns  = c(Bulk_ESS, Tail_ESS),
+    decimals = 0
+  ) |>
+  # highlight potential convergence issues:
+  tab_options(
+    table.font.size   = px(11),
+    data_row.padding  = px(3),
+    heading.align     = "left"
+  )
+
+```
+
+```{r}
+gtsave(tbl_gt, "summary_table.html")
+```
+
+## 3.6 Some extra fun code for showing the differences between schools (which is kind of cool)
+
+```{r}
+school_intercepts <- mod %>%
+  tidybayes::spread_draws(r_school_id[school_id, Intercept]) %>%
+  filter(!is.na(r_school_id)) %>%
+  mutate(school_id = factor(school_id))
+
+ggplot(
+  school_intercepts,
+  aes(x = r_school_id,
+      y = reorder(school_id, r_school_id),
+      fill = school_id)
+) +
+  stat_halfeye(point_interval = median_qi,
+               .width = c(0.5, 0.8, 0.95),
+               alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_fill_viridis_d(option = "C", guide = "none") +
+  labs(
+    x     = "School intercept (log-odds; deviation from grand mean)",
+    y     = "School",
+    title = "School-level differences in baseline performance"
+  ) +
+  my_theme
+```
