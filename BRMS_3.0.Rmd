@@ -1,0 +1,367 @@
+---
+title: "BRMS_3.0"
+output: html_document
+date: "2025-12-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Loading the necessities (e.g. libraries) and building the data-structure
+
+## 1.1 Loading cmdstanr 
+
+```{r}
+cmdstan_dir <- "/work/Bachelor/cmdstan" # <--- Set to your own path
+ver_dir <- list.dirs(cmdstan_dir, recursive = FALSE, full.names = TRUE)
+cmdstanr::set_cmdstan_path(ver_dir[grepl("cmdstan-", basename(ver_dir))])
+
+# Sanity checks
+cmdstanr::cmdstan_path()
+cmdstanr::cmdstan_version()
+```
+
+## 1.2 Loading packages
+
+```{r}
+library(cmdstanr)
+library(brms)
+library(tidyverse)
+library(tidybayes)
+library(ggplot2)
+library(ggdist)
+library(dplyr)
+library(stringr)
+library(gt)
+```
+
+
+## 1.3 Setting up the data structure
+
+```{r}
+# --- Defining the structure ---
+n_schools <- 15
+n_classes_per_school <- 5
+n_students_per_class <- 20
+
+n_items_pre  <- 12
+n_items_post <- 12
+n_items      <- n_items_pre + n_items_post
+
+total_students <- n_schools * n_classes_per_school * n_students_per_class
+
+# Students + grouping structure
+students <- data.frame(
+  school_id  = rep(1:n_schools,
+                   each = n_classes_per_school * n_students_per_class),
+  class_id   = rep(1:(n_schools * n_classes_per_school),
+                   each = n_students_per_class),
+  student_id = 1:total_students
+)
+
+# 50% treatment
+set.seed(123)
+students$treatment <- rbinom(total_students, 1, 0.5)
+
+# --- Items ---
+# 24 items total: 1–12 belong to pre (time = 0), 13–24 to post (time = 1)
+
+items <- tibble::tibble(
+  item_id = 1:n_items,
+  time    = factor(
+    c(rep("pre",  n_items_pre),
+      rep("post", n_items_post)),
+    levels = c("pre", "post")  # order is explicit
+  )
+)
+
+# --- Full design: each student sees only the items for that time ---
+df_design <- tidyr::expand_grid(
+  student_id = students$student_id,
+  item_id    = items$item_id
+) %>%
+  dplyr::left_join(students, by = "student_id") %>%
+  dplyr::left_join(items,   by = "item_id")
+
+# Make sure time is still a factor after joins (usually it is, but just in case):
+df_design$time <- factor(df_design$time, levels = c("pre", "post"))
+
+# Dummy response
+df_design$response <- 0L
+```
+
+# 2. Model specificaiton and prior predictive checks
+
+## 2.1 Specifying the model
+
+```{r}
+brms_formula <- bf(
+  response ~ 0 + time + time:treatment +
+    (1 + treatment | gr(item_id, by = time)) +
+    (1 + time | school_id / class_id / student_id)
+)
+```
+
+## 2.2 Taking a look at the default priors
+
+```{r}
+get_prior(
+  formula = brms_formula,
+  data = df_design,
+  family = bernoulli(link = "logit")
+)
+```
+
+## 2.3 Setting our own tighter priors
+
+```{r}
+priors <- c(
+  # Fixed effects
+  prior(normal(0.0, 0.5), class = "b"),
+  # Group-level SDs
+  prior(exponential(2), class = "sd"),
+  # Correlations
+  prior(lkj(2), class = "cor")
+)
+```
+
+## 2.4 Fitting the model using priors only
+
+```{r}
+fit_prior <- brm(
+  formula       = brms_formula,
+  data          = df_design,
+  family        = bernoulli(link = "logit"),
+  prior         = priors,
+  sample_prior  = "only",   # <--- Necessary for prior predictive checks
+  iter          = 2000,
+  chains        = 4,
+  cores         = 4,
+  threads = threading(3),
+  control = list(adapt_delta = 0.98, max_treedepth = 15),
+  seed          = 123,
+  backend = "cmdstanr",
+  file = "/work/Bachelor/brms_models/fit_prior_2.0"
+)
+```
+
+## 2.5 Checking model diagnostics
+
+```{r}
+plot(fit_prior)
+```
+
+## 2.6 Prior predictive draws and plotting it to see if it seems reasonable
+
+```{r}
+# Prior predictive draws for the responses
+y_tilde <- posterior_predict(fit_prior, ndraws = 200) 
+# matrix: draws x observations
+
+# Add a row index to design
+design <- df_design %>%
+  mutate(row_id = dplyr::row_number())
+
+# Convert to long format and attach design info
+y_long <- as_tibble(t(y_tilde)) %>%   # now Nobs x draws (V1, V2, ...)
+  mutate(row_id = design$row_id) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "response"
+  ) %>%
+  left_join(design %>% select(row_id, student_id, time, item_id),
+            by = "row_id")
+
+# Total score per student & time, for each draw
+student_scores <- y_long %>%
+  group_by(draw, student_id, time) %>%
+  summarise(total_score = sum(response), .groups = "drop")
+
+# Histogram of prior predictive total scores
+ggplot(student_scores, aes(x = total_score, fill = time)) +
+  geom_histogram(binwidth = 1, boundary = -0.5) +
+  facet_wrap(~ time, nrow = 2) +
+  labs(
+    x = "Total correct answers (per student)",
+    y = "Frequency",
+    title = "Prior predictive distribution of total scores"
+  )
+```
+
+
+# 3 Simulating synthetic data and model validation
+
+## 3.1 Drawing the priors and picking a few draw ID's
+
+```{r}
+set.seed(123)
+
+prior_draws <- as_draws_df(fit_prior) # Get the prior draws into a data frame
+draw_ids <- sample(1:nrow(prior_draws), size = 5)  # Picking a few draw IDs I want to test (e.g. 5)
+
+# Parameter names to track (b_, sd_, cor_)
+pars_all <- get_variables(fit_prior) %>%
+  stringr::str_subset("^(b_|sd_|cor_)")
+```
+
+## 3.2 Specifying a function which loops over each draw_id, generates a synthetic dataset, fits the model to it and checks reocvery 
+
+```{r}
+simulate_and_fit_once <- function(draw_id, return_fit = FALSE) {
+  # 1) simulate fake data from that prior draw
+  y_fake <- posterior_predict(
+    fit_prior,
+    newdata  = df_design,
+    draw_ids = draw_id
+  )[1, ]
+  
+  df_fake <- df_design
+  df_fake$response <- as.integer(y_fake)
+  
+  # 2) fit model to the fake data
+  fit_fake <- brm(
+    formula      = brms_formula,
+    data         = df_fake,
+    family       = bernoulli(link = "logit"),
+    prior        = priors,
+    iter         = 1500,
+    chains       = 4,
+    cores        = 4,
+    threads      = threading(4),
+    control      = list(adapt_delta = 0.95, max_treedepth = 15),
+    seed         = 12345,
+    backend      = "cmdstanr"
+  )
+  
+  # 3) summarise posterior for the parameters of interest
+  post_sum <- posterior_summary(fit_fake, variable = pars_all)
+  
+  # 4) extract the true parameter values from the same prior draw
+  true_vals <- as.numeric(prior_draws[draw_id, pars_all])
+  
+  summary_tbl <- tibble(
+    draw_id   = draw_id,
+    par       = pars_all,
+    true      = true_vals,
+    post_mean = post_sum[, "Estimate"],
+    l95       = post_sum[, "Q2.5"],
+    u95       = post_sum[, "Q97.5"],
+    covered   = (true >= l95 & true <= u95)
+  )
+  
+  if (return_fit) {
+    # return both fit and summary in a list
+    return(list(
+      fit     = fit_fake,
+      results = summary_tbl
+    ))
+  } else {
+    # old behaviour: just the tibble
+    return(summary_tbl)
+  }
+}
+```
+
+```{r}
+# Using the function to get the results
+set.seed(123)
+results <- map_dfr(draw_ids, simulate_and_fit_once)
+```
+
+## 3.3 Checking diganostics
+
+```{r}
+diag_obj  <- simulate_and_fit_once(draw_ids[1], return_fit = TRUE) # We re-run it once to get the diagnostics, since the current function does not return this
+
+fit_fake  <- diag_obj$fit        # this is the fit for that one draw
+res_draw1 <- diag_obj$results
+
+plot(fit_fake)
+summary(fit_fake)
+```
+
+
+## 3.4 Checking coverage
+
+```{r}
+coverage_by_par <- results %>%
+  group_by(par) %>%
+  summarise(
+    n_reps            = n(),                            # how many datasets per parameter
+    coverage_95       = mean(covered),                  # proportion of TRUE
+    mean_true         = mean(true),
+    mean_estimate     = mean(post_mean),
+    mean_bias         = mean(post_mean - true),
+    rmse              = sqrt(mean((post_mean - true)^2)),
+    mean_interval_w95 = mean(u95 - l95),
+    .groups = "drop"
+  )
+```
+
+## 3.5 Making a pretty coverage-table
+
+```{r}
+coverage_pretty <- coverage_by_par %>%
+  # classify parameter type and make a nicer label
+  mutate(
+    type = case_when(
+      str_starts(par, "b_")   ~ "Fixed effect",
+      str_starts(par, "sd_")  ~ "Random SD",
+      str_starts(par, "cor_") ~ "Random correlation",
+      TRUE                    ~ "Other"
+    ),
+    par_label = case_when(
+      str_starts(par, "b_")   ~ str_remove(par, "^b_"),
+      str_starts(par, "sd_")  ~ paste0("SD(", str_remove(par, "^sd_"), ")"),
+      str_starts(par, "cor_") ~ paste0("Cor(", str_remove(par, "^cor_"), ")"),
+      TRUE                    ~ par
+    ),
+    coverage_95 = coverage_95 * 100  # to %
+  ) %>%
+  # round numeric columns a bit
+  mutate(
+    coverage_95       = round(coverage_95, 1),
+    mean_true         = round(mean_true, 3),
+    mean_estimate     = round(mean_estimate, 3),
+    mean_bias         = round(mean_bias, 3),
+    rmse              = round(rmse, 3),
+    mean_interval_w95 = round(mean_interval_w95, 3)
+  ) %>%
+  # choose order & nicer column names
+  select(
+    Type          = type,
+    Parameter     = par_label,
+    Replications  = n_reps,
+    `Coverage 95%`= coverage_95,
+    `Mean true`   = mean_true,
+    `Mean est.`   = mean_estimate,
+    `Mean bias`   = mean_bias,
+    RMSE          = rmse,
+    `Mean 95% width` = mean_interval_w95
+  ) %>%
+  arrange(Type, Parameter)
+
+coverage_table_gt <- coverage_pretty %>%
+  gt() %>%
+  tab_header(
+    title    = "Parameter recovery and interval coverage",
+    subtitle = paste0(
+      "Based on ", unique(coverage_by_par$n_reps),
+      " simulated datasets per parameter"
+    )
+  ) %>%
+  cols_align(
+    align = "center",
+    columns = everything()
+  ) %>%
+  tab_options(
+    table.font.size = px(10)
+  )
+
+```
+
+```{r}
+gtsave(coverage_table_gt, "coverage_table.html")
+```
