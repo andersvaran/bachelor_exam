@@ -97,7 +97,7 @@ df_design$response <- 0L
 
 ```{r}
 brms_formula <- bf(
-  response ~ 0 + time + time:treatment +
+  response ~ 0 + treatment + treatment:time +
     (1 + treatment | gr(item_id, by = time)) +
     (1 + time | school_id / class_id / student_id)
 )
