@@ -31,6 +31,7 @@ library(ggplot2)
 library(patchwork)
 library(brms)
 library(tibble)
+library(gt)
 ```
 
 ## 2 Data pre-processing
@@ -457,6 +458,7 @@ df_analysis %>% count(time)
 df_analysis %>% count(time, treatment)
 
 df_analysis <- df_analysis %>% select(-StuID, -item_name) # Removing StuID and item_name because we already have them as "student_id" and "item_id"
+df_analysis$treatment <- as.factor(df_analysis$treatment) # Making sure that treatment is a factor (0 = control, 1 = treated)
 ```
 
 
@@ -466,7 +468,7 @@ df_analysis <- df_analysis %>% select(-StuID, -item_name) # Removing StuID and i
 
 ```{r}
 brms_formula <- bf(
-  response ~ 0 + time + time:treatment +
+  response ~ 0 + treatment + treatment:time +
     (1 + treatment | gr(item_id, by = time)) +
     (1 + time | school_id / class_id / student_id)
 )
